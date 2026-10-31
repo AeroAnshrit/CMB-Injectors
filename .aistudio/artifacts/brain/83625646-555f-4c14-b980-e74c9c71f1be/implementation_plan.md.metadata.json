@@ -1,0 +1,6 @@
+{
+  "summary":  "Comprehensive software architecture and aerospace propulsion engineering plan for the ThrustWorks Dynetics 5 kN LOX/RP-1 Swirl Coaxial Injector Calculator. Covers frontend-to-OpenFOAM/Python bridging, the 4-stage workflow & dark-slate telemetry UI, OpenFOAM post-processing extraction (Mass Flow, Spray Cone Angle, VOF, and Live Residuals), and a multi-stage CFD validation strategy.",
+  "updatedAt":  "2026-10-31T15:08:43.239263432Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}

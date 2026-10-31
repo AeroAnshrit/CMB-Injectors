@@ -1,0 +1,8 @@
+{
+  "name": "Injector  mass flow rate predicttion ",
+  "description": "Swirl Coaxial Injector CFD Sizing, OpenFOAM Case Automation, VOF Post-Processing, and Validation Suite for 5 kN LOX/RP-1 Rocket Engines.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
