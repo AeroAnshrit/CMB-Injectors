@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @license
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -341,16 +341,70 @@ sigma           ${regime.sigmaOx.toFixed(5)}; // Interfacial surface tension [N/
 CMB RD-0110 Parametric blockMesh Generator & FastAPI Execution Engine
 Zero snappyHexMesh / surfaceFeatureExtract dependencies.
 Generates pure structured 5-degree axisymmetric wedge meshes from V1-V16 coordinates,
-executes OpenFOAM (${config.solver}), and computes Mass Flow Rate, Cd, and Spray Cone Angle (2*theta).
+executes OpenFOAM (${config.solver}) via WSL (Windows -> Ubuntu bridge), and computes
+Mass Flow Rate, Cd, and Spray Cone Angle (2*theta).
+
+ARCHITECTURE NOTE (Windows + WSL):
+  This backend runs on Windows Python. OpenFOAM lives inside Ubuntu (WSL).
+  All subprocess calls MUST use ["wsl", "bash", "-ic", "<command>"] so that
+  Ubuntu loads the OpenFOAM environment variables (sourced from ~/.bashrc) before
+  executing any OpenFOAM utility. Calling ["blockMesh"] directly on Windows will
+  crash with "command not found".
 """
 
 import math
+import subprocess
+import shutil
+import tempfile
+import os
 from pathlib import Path
-from typing import Dict, List, Tuple
-from fastapi import FastAPI
+from typing import Dict, List, Tuple, Optional
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="CMB RD-0110 Parametric blockMesh Backend", version="3.0.0")
+app = FastAPI(title="CMB RD-0110 Parametric blockMesh Backend", version="3.1.0")
+
+# Allow the Vite dev server (port 3000) to call this backend (port 8000)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def wsl_run(openfoam_cmd: str, case_dir: str, timeout: int = 300) -> subprocess.CompletedProcess:
+    """
+    Run an OpenFOAM command inside Ubuntu (WSL) from Windows Python.
+
+    Uses 'wsl bash -ic' so Ubuntu's ~/.bashrc is sourced, which means
+    OpenFOAM environment variables (WM_PROJECT_DIR, PATH, etc.) are loaded
+    before the command executes.
+
+    Args:
+        openfoam_cmd:  The bare OpenFOAM command, e.g. "blockMesh" or "checkMesh -allGeometry"
+        case_dir:      Windows absolute path to the OpenFOAM case directory
+        timeout:       Max seconds to wait before raising TimeoutError
+
+    Returns:
+        subprocess.CompletedProcess with stdout and stderr captured
+    """
+    # Convert Windows path (C:\\Users\\...) to WSL path (/mnt/c/Users/...)
+    wsl_path = case_dir.replace("\\\\", "/").replace("\\", "/")
+    if len(wsl_path) >= 2 and wsl_path[1] == ":":
+        drive = wsl_path[0].lower()
+        wsl_path = f"/mnt/{drive}" + wsl_path[2:]
+
+    # Wrap the command so it runs in the correct WSL case directory
+    full_cmd = f"cd '{wsl_path}' && {openfoam_cmd}"
+
+    return subprocess.run(
+        ["wsl", "bash", "-ic", full_cmd],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
 
 class Rd0110DimensionsPayload(BaseModel):
@@ -423,16 +477,19 @@ def solve_bazarov_air_core_x(A: float) -> float:
 async def generate_rd0110_mesh_and_predict(payload: Rd0110DimensionsPayload):
     """
     1. Generates pure structured system/blockMeshDict from V1-V16 coordinates (5 deg wedge).
-    2. Executes blockMesh -> setFields -> ${config.solver} (no snappyHexMesh / surfaceFeatureExtract).
-    3. Enforces pressure-to-mass-flow calculation and outputs Cd and Spray Cone Angle (2*theta).
+    2. Executes blockMesh -> checkMesh -> setFields -> ${config.solver} via WSL (Windows->Ubuntu).
+    3. Outputs Cd and Spray Cone Angle (2*theta).
+
+    CRITICAL: All OpenFOAM calls use wsl_run() which bridges Windows -> Ubuntu/WSL.
+    Calling blockMesh/checkMesh/interIsoFoam directly on Windows will crash.
     """
+    import os
     verts = compute_v1_to_v16_vertices(payload)
     r_no_mm = payload.D_n_o_mm / 2.0
     r_in_o_mm = payload.d_in_o_mm / 2.0
     r_sf_mm = payload.D_s_f_mm / 2.0
     r_in_f_mm = payload.d_in_f_mm / 2.0
 
-    # Bazarov Geometric Characteristic Numbers (A_o = 2.18, A_f = 30.61 at baseline)
     A_o = (payload.R_in_o_mm * r_no_mm) / (payload.N_o * (r_in_o_mm ** 2))
     A_f = (payload.R_in_f_mm * r_sf_mm) / (payload.N_f * (r_in_f_mm ** 2))
 
@@ -445,14 +502,60 @@ async def generate_rd0110_mesh_and_predict(payload: Rd0110DimensionsPayload):
     ox_area_m2 = math.pi * ((r_no_mm * 1e-3) ** 2)
     m_dot_ox_kg_s = cd_ox * ox_area_m2 * math.sqrt(2.0 * ${regime.rhoOx} * delta_p_pa)
 
+    # WSL OpenFOAM Pipeline: blockMesh -> checkMesh -> setFields -> ${config.solver}
+    pipeline_log: Dict[str, str] = {}
+    case_dir = str(Path(os.path.dirname(__file__)).parent / "case_rd0110_wedge")
+
+    try:
+        # Step 1: blockMesh — via WSL bash -ic so OpenFOAM env vars are loaded
+        result = wsl_run("blockMesh", case_dir, timeout=120)
+        pipeline_log["blockMesh"] = result.stdout + result.stderr
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail={"step": "blockMesh", "log": pipeline_log["blockMesh"]})
+
+        # Step 2: checkMesh — via WSL bash -ic
+        result = wsl_run("checkMesh", case_dir, timeout=60)
+        pipeline_log["checkMesh"] = result.stdout + result.stderr
+
+        # Step 3: setFields — via WSL bash -ic
+        result = wsl_run("setFields", case_dir, timeout=60)
+        pipeline_log["setFields"] = result.stdout + result.stderr
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail={"step": "setFields", "log": pipeline_log["setFields"]})
+
+        # Step 4: interIsoFoam — via WSL bash -ic
+        result = wsl_run("${config.solver}", case_dir, timeout=3600)
+        pipeline_log["${config.solver}"] = result.stdout + result.stderr
+        if result.returncode != 0:
+            raise HTTPException(status_code=500, detail={"step": "${config.solver}", "log": pipeline_log["${config.solver}"]})
+
+    except FileNotFoundError:
+        raise HTTPException(status_code=503, detail="WSL not found. Install WSL and ensure 'wsl' is in PATH.")
+    except subprocess.TimeoutExpired as e:
+        raise HTTPException(status_code=504, detail=f"OpenFOAM timed out: {e}")
+
     return {
-        "pipeline": ["blockMesh", "setFields", "${config.solver}"],
+        "pipeline": ["blockMesh", "checkMesh", "setFields", "${config.solver}"],
+        "wsl_bridge": "windows_to_ubuntu",
         "A_o": round(A_o, 2),
         "A_f": round(A_f, 2),
         "discharge_coefficient_cd": round(cd_ox, 4),
         "spray_cone_angle_2theta_deg": round(spray_cone_2theta_deg, 2),
         "mass_flow_ox_kg_s": round(m_dot_ox_kg_s, 4),
         "vertices_v1_v16": verts,
+        "pipeline_log": pipeline_log,
+    }
+
+
+@app.get("/api/health")
+async def health_check():
+    """Verifies backend is alive and WSL/Ubuntu is reachable."""
+    try:
+        result = wsl_run("echo OK", "/tmp", timeout=10)
+        wsl_ok = result.returncode == 0
+    except FileNotFoundError:
+        wsl_ok = False
+    return {"status": "running", "wsl_reachable": wsl_ok}
     }
 `;
 
