@@ -21,6 +21,7 @@ Implements the 5-Stage ANSYS-style OpenFOAM CFD pipeline inside WSL Ubuntu
 """
 
 import math
+import os
 import subprocess
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -824,49 +825,78 @@ def write_case_files(p: Rd0110DimensionsPayload) -> int:
     """Writes all required OpenFOAM case files, 3D STL, and empty .foam stub into ~/OpenFOAM/CMB-v2406/run."""
     unc_dir = get_wsl_run_dir_unc()
     stl_content, tri_count = generate_3d_fluid_domain_stl(p)
+
+    # 1. Force directory creation via os.makedirs and WSL
+    system_dir = unc_dir / "system"
+    constant_dir = unc_dir / "constant"
+    tri_dir = constant_dir / "triSurface"
+    zero_dir = unc_dir / "0"
+
+    os.makedirs(unc_dir, exist_ok=True)
+    os.makedirs(system_dir, exist_ok=True)
+    os.makedirs(constant_dir, exist_ok=True)
+    os.makedirs(tri_dir, exist_ok=True)
+    os.makedirs(zero_dir, exist_ok=True)
+
+    wsl_run(f"mkdir -p {WSL_RUN_DIR_LINUX}/system {WSL_RUN_DIR_LINUX}/constant/triSurface {WSL_RUN_DIR_LINUX}/0")
+
+    # 2. Write 3D Fluid Domain STL with fallback
+    stl_file = tri_dir / STL_FILENAME
     try:
-        unc_dir.mkdir(parents=True, exist_ok=True)
-        system_dir = unc_dir / "system"
-        constant_dir = unc_dir / "constant"
-        tri_dir = constant_dir / "triSurface"
-        zero_dir = unc_dir / "0"
-        system_dir.mkdir(parents=True, exist_ok=True)
-        constant_dir.mkdir(parents=True, exist_ok=True)
-        tri_dir.mkdir(parents=True, exist_ok=True)
-        zero_dir.mkdir(parents=True, exist_ok=True)
-
-        # 1. Write 3D Fluid Domain STL
-        (tri_dir / STL_FILENAME).write_text(stl_content, encoding="utf-8")
-
-        # 2. Write blockMeshDict & snappyHexMeshDict
-        (system_dir / "blockMeshDict").write_text(
-            generate_default_block_mesh_dict(p), encoding="utf-8"
+        stl_file.write_text(stl_content, encoding="utf-8")
+    except Exception as unc_err:
+        proc = subprocess.run(
+            ["wsl", "bash", "-ic", f"cat > {WSL_RUN_DIR_LINUX}/constant/triSurface/{STL_FILENAME}"],
+            input=stl_content,
+            text=True,
+            capture_output=True,
+            timeout=30,
         )
-        shm_content = p.snappyHexMeshDict or generate_default_snappy_hex_mesh_dict(p)
-        (system_dir / "snappyHexMeshDict").write_text(shm_content, encoding="utf-8")
+        if proc.returncode != 0:
+            raise RuntimeError(f"Failed to write STL via UNC ({unc_err}) and WSL fallback ({proc.stderr})")
 
-        # 3. controlDict, fvSchemes, fvSolution
-        cd_content = p.controlDict or generate_default_control_dict(p)
-        (system_dir / "controlDict").write_text(cd_content, encoding="utf-8")
-        (system_dir / "fvSchemes").write_text(generate_default_fv_schemes(), encoding="utf-8")
-        (system_dir / "fvSolution").write_text(generate_default_fv_solution(), encoding="utf-8")
+    # 3. Verify physical STL writing
+    stl_written = False
+    if stl_file.exists() and stl_file.stat().st_size > 0:
+        stl_written = True
+    else:
+        chk = wsl_run(f"test -s {WSL_RUN_DIR_LINUX}/constant/triSurface/{STL_FILENAME} && echo OK")
+        if "OK" in chk.stdout:
+            stl_written = True
 
-        # 4. constant files
-        tp_content = p.transportProperties or generate_default_transport_properties()
-        (constant_dir / "transportProperties").write_text(tp_content, encoding="utf-8")
-        (constant_dir / "g").write_text(generate_default_g(), encoding="utf-8")
-        (constant_dir / "turbulenceProperties").write_text(generate_default_turbulence_properties(), encoding="utf-8")
+    if not stl_written:
+        raise RuntimeError(
+            f"Verification failed: STL file was not physically written to {stl_file} or {WSL_RUN_DIR_LINUX}/constant/triSurface/{STL_FILENAME}"
+        )
 
-        # 5. 0/ initial boundary fields
-        (zero_dir / "p_rgh").write_text(generate_field_p_rgh(), encoding="utf-8")
-        (zero_dir / "alpha.liquid").write_text(generate_field_alpha_liquid("alpha.liquid"), encoding="utf-8")
-        (zero_dir / "alpha.water").write_text(generate_field_alpha_liquid("alpha.water"), encoding="utf-8")
-        (zero_dir / "U").write_text(generate_field_u(), encoding="utf-8")
+    # 4. Write blockMeshDict & snappyHexMeshDict
+    (system_dir / "blockMeshDict").write_text(
+        generate_default_block_mesh_dict(p), encoding="utf-8"
+    )
+    shm_content = p.snappyHexMeshDict or generate_default_snappy_hex_mesh_dict(p)
+    (system_dir / "snappyHexMeshDict").write_text(shm_content, encoding="utf-8")
 
-        # 6. Pre-create empty rd0110_mesh.foam stub
-        (unc_dir / FOAM_STUB_FILENAME).write_text("", encoding="utf-8")
-    except Exception:
-        wsl_run(f"mkdir -p system constant/triSurface 0 && touch {FOAM_STUB_FILENAME}")
+    # 5. controlDict, fvSchemes, fvSolution
+    cd_content = p.controlDict or generate_default_control_dict(p)
+    (system_dir / "controlDict").write_text(cd_content, encoding="utf-8")
+    (system_dir / "fvSchemes").write_text(generate_default_fv_schemes(), encoding="utf-8")
+    (system_dir / "fvSolution").write_text(generate_default_fv_solution(), encoding="utf-8")
+
+    # 6. constant files
+    tp_content = p.transportProperties or generate_default_transport_properties()
+    (constant_dir / "transportProperties").write_text(tp_content, encoding="utf-8")
+    (constant_dir / "g").write_text(generate_default_g(), encoding="utf-8")
+    (constant_dir / "turbulenceProperties").write_text(generate_default_turbulence_properties(), encoding="utf-8")
+
+    # 7. 0/ initial boundary fields
+    (zero_dir / "p_rgh").write_text(generate_field_p_rgh(), encoding="utf-8")
+    (zero_dir / "alpha.liquid").write_text(generate_field_alpha_liquid("alpha.liquid"), encoding="utf-8")
+    (zero_dir / "alpha.water").write_text(generate_field_alpha_liquid("alpha.water"), encoding="utf-8")
+    (zero_dir / "U").write_text(generate_field_u(), encoding="utf-8")
+
+    # 8. Pre-create empty rd0110_mesh.foam stub
+    (unc_dir / FOAM_STUB_FILENAME).write_text("", encoding="utf-8")
+
     return tri_count
 
 
@@ -910,32 +940,64 @@ async def generate_3d_stl_endpoint(payload: Rd0110DimensionsPayload):
       Generates the 3D internal fluid volume STL (constant/triSurface/rd0110_fluid_domain.stl)
       from the RD-0110 geometric parameters.
     """
-    sync_payload_from_nested_config(payload)
-    metrics = compute_bazarov_metrics(payload)
-    tri_count = write_case_files(payload)
+    try:
+        sync_payload_from_nested_config(payload)
+        metrics = compute_bazarov_metrics(payload)
 
-    x_max = payload.L_r_mm + payload.L_n_o_mm + payload.L_c_o_mm + payload.L_s_o_mm
-    d_max = max(payload.D_s_o_mm, payload.D_s_f_mm)
+        # Force Directory Creation: Explicitly create ~/OpenFOAM/CMB-v2406/run/constant/triSurface
+        unc_dir = get_wsl_run_dir_unc()
+        tri_dir = unc_dir / "constant" / "triSurface"
+        os.makedirs(tri_dir, exist_ok=True)
+        wsl_run(f"mkdir -p {WSL_RUN_DIR_LINUX}/constant/triSurface")
 
-    return {
-        "stage": "CAD_STL_GENERATION",
-        "status": "STL_GENERATED",
-        "stl_path": f"{WSL_RUN_DIR_LINUX}/constant/triSurface/{STL_FILENAME}",
-        "triangle_count": tri_count,
-        "watertight": True,
-        "bounding_box_mm": {
-            "x": round(x_max, 2),
-            "y": round(d_max, 2),
-            "z": round(d_max, 2),
-        },
-        "regions": [
-            "injector_walls",
-            "inlet_lox_tangential",
-            "inlet_rp1_tangential",
-            "chamber_outlet",
-        ],
-        **metrics,
-    }
+        # Generate STL & write case files
+        tri_count = write_case_files(payload)
+
+        # Verify STL Writing: Ensure rd0110_fluid_domain.stl is physically written
+        target_stl = tri_dir / STL_FILENAME
+        is_verified = False
+        if target_stl.exists() and target_stl.stat().st_size > 0:
+            is_verified = True
+        else:
+            chk = wsl_run(f"test -s {WSL_RUN_DIR_LINUX}/constant/triSurface/{STL_FILENAME} && echo OK")
+            if "OK" in chk.stdout:
+                is_verified = True
+
+        if not is_verified:
+            raise HTTPException(
+                status_code=500,
+                detail=f"Verification failed: STL file was not physically written to {target_stl} or {WSL_RUN_DIR_LINUX}/constant/triSurface/{STL_FILENAME}",
+            )
+
+        x_max = payload.L_r_mm + payload.L_n_o_mm + payload.L_c_o_mm + payload.L_s_o_mm
+        d_max = max(payload.D_s_o_mm, payload.D_s_f_mm)
+
+        return {
+            "stage": "CAD_STL_GENERATION",
+            "status": "STL_GENERATED",
+            "stl_path": f"{WSL_RUN_DIR_LINUX}/constant/triSurface/{STL_FILENAME}",
+            "triangle_count": tri_count,
+            "watertight": True,
+            "bounding_box_mm": {
+                "x": round(x_max, 2),
+                "y": round(d_max, 2),
+                "z": round(d_max, 2),
+            },
+            "regions": [
+                "injector_walls",
+                "inlet_lox_tangential",
+                "inlet_rp1_tangential",
+                "chamber_outlet",
+            ],
+            **metrics,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to generate 3D STL: {str(e)}",
+        )
 
 
 @app.post("/api/cfd/mesh-only")
@@ -1056,3 +1118,18 @@ async def predict_mass_flow(payload: Rd0110DimensionsPayload):
         "mode": "analytical_only",
         **metrics,
     }
+
+
+@app.post("/api/cfd/rd0110-blockmesh")
+async def rd0110_blockmesh_legacy_alias(payload: Rd0110DimensionsPayload):
+    """Backward compatibility alias."""
+    return await generate_and_check_mesh_only(payload)
+
+
+def main():
+    import uvicorn
+    uvicorn.run("backend.rd0110_blockmesh_backend:app", host="127.0.0.1", port=8000, reload=True)
+
+
+if __name__ == "__main__":
+    main()
