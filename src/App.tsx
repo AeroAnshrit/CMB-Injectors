@@ -28,6 +28,7 @@ import {
   Box,
   Grid,
   Activity,
+  Trash2,
 } from 'lucide-react';
 
 type TopNavTab = 'workspace' | 'openfoam_bridge' | 'post_processing' | 'validation_plan';
@@ -41,6 +42,8 @@ export default function App() {
 
   // Simulation & backend API state
   const [isSimulating, setIsSimulating] = useState<boolean>(false);
+  const [isClearingCache, setIsClearingCache] = useState<boolean>(false);
+  const [openfoamLog, setOpenfoamLog] = useState<string | null>(null);
   const [visibleResidualSteps, setVisibleResidualSteps] = useState<number>(120);
   const [statusBanner, setStatusBanner] = useState<string | null>(null);
   const [backendPrediction, setBackendPrediction] = useState<{
@@ -82,32 +85,19 @@ export default function App() {
     };
   }, [config, physics.pressureDropMPa]);
 
-  // Live simulation animation loop when user clicks "Run CFD Simulation"
+  // Live simulation residual animation loop while real OpenFOAM simulation is executing in background
   useEffect(() => {
     if (!isSimulating) return;
     const timer = setInterval(() => {
       setVisibleResidualSteps((prev) => {
-        if (prev >= physics.residuals.length) {
-          setIsSimulating(false);
-          setStatusBanner(
-            `OpenFOAM ${config.solver} (Pure blockMesh V1-V16) converged at ΔP = ${physics.pressureDropMPa.toFixed(2)} MPa -> Element ṁ = ${(physics.cfdExtractedOxMassFlowKgS + physics.cfdExtractedFuelMassFlowKgS).toFixed(4)} kg/s, C_d = ${physics.cdOxOpenFoamCfd.toFixed(3)}, 2θ = ${physics.sprayConeAngleOpenFoamDeg.toFixed(1)}°`
-          );
-          return physics.residuals.length;
+        if (prev >= physics.residuals.length - 8) {
+          return Math.max(12, physics.residuals.length - 20);
         }
-        return prev + 6;
+        return prev + 5;
       });
-    }, 90);
+    }, 120);
     return () => clearInterval(timer);
-  }, [
-    isSimulating,
-    physics.residuals.length,
-    config.solver,
-    physics.pressureDropMPa,
-    physics.cfdExtractedOxMassFlowKgS,
-    physics.cfdExtractedFuelMassFlowKgS,
-    physics.cdOxOpenFoamCfd,
-    physics.sprayConeAngleOpenFoamDeg,
-  ]);
+  }, [isSimulating, physics.residuals.length]);
 
   const updateConfig = <K extends keyof InjectorConfig>(key: K, value: InjectorConfig[K]) => {
     setConfig((prev) => {
@@ -191,20 +181,115 @@ export default function App() {
   };
 
   const handleRunSimulation = async () => {
-    setVisibleResidualSteps(8);
+    setVisibleResidualSteps(10);
     setIsSimulating(true);
     setStatusBanner(
-      `Executing ${config.solver} (${config.turbulence}) on pure structured V1-V16 blockMesh (5° wedge, ${physics.estimatedCellCount.toLocaleString()} hex cells) at ΔP = ${physics.pressureDropMPa.toFixed(2)} MPa...`
+      `Triggering FastAPI backend (http://127.0.0.1:8000/api/cfd/rd0110-blockmesh) to write case files & run OpenFOAM blockMesh + ${config.solver} in WSL (~/OpenFOAM/CMB-v2406/run)...`
     );
 
     try {
-      await fetch('/api/cfd/rd0110-blockmesh', {
+      const files = generateOpenFoamCaseFiles(config, physics);
+      const bmFile = files.find((f) => f.filename === 'system/blockMeshDict')?.content;
+      const cdFile = files.find((f) => f.filename === 'system/controlDict')?.content;
+      const tpFile = files.find((f) => f.filename === 'constant/transportProperties')?.content;
+
+      const payload = {
+        D_s_o_mm: config.oxSwirlChamberDiameterMm,
+        L_s_o_mm: config.oxSwirlChamberLengthMm,
+        L_c_o_mm: config.oxConvergentConeLengthMm,
+        D_n_o_mm: config.oxNozzleInnerDiameterMm,
+        L_n_o_mm: config.oxNozzleLengthMm,
+        h_p_mm: config.oxPostWallThicknessMm,
+        L_r_mm: config.recessLengthMm,
+        N_o: config.oxInletHoleCount,
+        d_in_o_mm: config.oxInletHoleDiameterMm,
+        R_in_o_mm: config.oxTangentialOffsetRadiusMm,
+        D_s_f_mm: config.fuelNozzleInnerDiameterMm,
+        delta_f_mm: config.fuelAnnularSlotWidthMm,
+        L_s_f_mm: config.fuelChamberAxialDepthMm,
+        N_f: config.fuelInletHoleCount,
+        d_in_f_mm: config.fuelInletHoleDiameterMm,
+        R_in_f_mm: config.fuelTangentialOffsetRadiusMm,
+        differential_pressure_mpa: config.inputDifferentialPressureMPa ?? physics.pressureDropMPa,
+        solver: config.solver,
+        blockMeshDict: bmFile,
+        controlDict: cdFile,
+        transportProperties: tpFile,
+        config,
+      };
+
+      const res = await fetch('http://127.0.0.1:8000/api/cfd/rd0110-blockmesh', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ config }),
+        body: JSON.stringify(payload),
       });
-    } catch {
-      // Handled by local preview loop
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => null);
+        throw new Error(errJson?.detail || `FastAPI server returned HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      setVisibleResidualSteps(physics.residuals.length);
+
+      if (data.status === 'CONVERGED') {
+        setStatusBanner(
+          `OpenFOAM ${config.solver} executed via WSL in ~/OpenFOAM/CMB-v2406/run: Mesh & Solver converged! C_d = ${data.discharge_coefficient_cd}, 2θ = ${data.spray_cone_angle_2theta_deg}°, ṁ_ox = ${data.mass_flow_ox_kg_s} kg/s.`
+        );
+      } else {
+        setStatusBanner(
+          `OpenFOAM execution finished with status: ${data.status}. Solver status: ${data.solver_status || 'N/A'}. Check pipeline logs.`
+        );
+      }
+
+      if (data.pipeline_log) {
+        setOpenfoamLog(JSON.stringify(data.pipeline_log, null, 2));
+      }
+    } catch (err: any) {
+      console.error('FastAPI OpenFOAM execution error:', err);
+      setStatusBanner(
+        `Failed to execute OpenFOAM via FastAPI: ${err.message || err}. Ensure uvicorn is running on http://127.0.0.1:8000.`
+      );
+    } finally {
+      setIsSimulating(false);
+    }
+  };
+
+  const handleClearCache = async () => {
+    if (
+      !window.confirm(
+        'Clear OpenFOAM Simulation Cache?\\n\\nThis will completely delete all case files, polyMesh, and time directories inside ~/OpenFOAM/CMB-v2406/run in WSL.'
+      )
+    ) {
+      return;
+    }
+
+    setIsClearingCache(true);
+    setStatusBanner('Requesting DELETE http://127.0.0.1:8000/api/cfd/clear to empty ~/OpenFOAM/CMB-v2406/run...');
+
+    try {
+      const res = await fetch('http://127.0.0.1:8000/api/cfd/clear', {
+        method: 'DELETE',
+      });
+
+      if (!res.ok) {
+        const errJson = await res.json().catch(() => null);
+        throw new Error(errJson?.detail || `FastAPI returned HTTP ${res.status}`);
+      }
+
+      const data = await res.json();
+      setStatusBanner(
+        `Simulation cache cleared: ${data.message || '~/OpenFOAM/CMB-v2406/run is now completely empty.'}`
+      );
+      setVisibleResidualSteps(0);
+      setOpenfoamLog(null);
+    } catch (err: any) {
+      console.error('Clear cache error:', err);
+      setStatusBanner(
+        `Failed to clear cache: ${err.message || err}. Ensure uvicorn is running on http://127.0.0.1:8000.`
+      );
+    } finally {
+      setIsClearingCache(false);
     }
   };
 
@@ -908,15 +993,44 @@ export default function App() {
                       </div>
                     </div>
 
-                    <button
-                      type="button"
-                      onClick={handleRunSimulation}
-                      disabled={isSimulating}
-                      className="w-full py-2.5 px-4 bg-white hover:bg-neutral-200 disabled:opacity-60 text-black font-semibold text-xs rounded transition-colors flex items-center justify-center gap-2"
-                    >
-                      <Play className="w-4 h-4 fill-current" />
-                      {isSimulating ? `Running Solver (${simProgressPct}%)...` : 'Run CFD Simulation'}
-                    </button>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <button
+                        type="button"
+                        onClick={handleRunSimulation}
+                        disabled={isSimulating || isClearingCache}
+                        className="py-2.5 px-3 bg-white hover:bg-neutral-200 disabled:opacity-60 text-black font-semibold text-xs rounded transition-colors flex items-center justify-center gap-2"
+                      >
+                        <Play className="w-4 h-4 fill-current" />
+                        {isSimulating ? 'Running OpenFOAM...' : 'Run CFD Simulation'}
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={handleClearCache}
+                        disabled={isSimulating || isClearingCache}
+                        className="py-2.5 px-3 bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white font-semibold text-xs rounded transition-colors flex items-center justify-center gap-1.5 shadow-sm"
+                        title="Completely delete contents of ~/OpenFOAM/CMB-v2406/run in WSL to start fresh"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                        {isClearingCache ? 'Clearing Cache...' : 'Clear Simulation Cache'}
+                      </button>
+                    </div>
+
+                    {openfoamLog && (
+                      <div className="mt-2 p-2.5 bg-black border border-neutral-800 rounded font-mono text-[10px] text-neutral-300 max-h-40 overflow-y-auto">
+                        <div className="text-neutral-400 font-semibold mb-1 flex items-center justify-between border-b border-neutral-800 pb-1">
+                          <span>OpenFOAM Execution Logs (~/OpenFOAM/CMB-v2406/run):</span>
+                          <button
+                            type="button"
+                            onClick={() => setOpenfoamLog(null)}
+                            className="text-neutral-500 hover:text-white px-1 text-xs"
+                          >
+                            ✕
+                          </button>
+                        </div>
+                        <pre className="whitespace-pre-wrap">{openfoamLog}</pre>
+                      </div>
+                    )}
 
                     <div className="grid grid-cols-2 gap-2.5">
                       <button
