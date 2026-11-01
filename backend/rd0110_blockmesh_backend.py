@@ -71,9 +71,13 @@ def wsl_run(openfoam_cmd: str, case_dir: str, timeout: int = 300) -> subprocess.
     """
     Run an OpenFOAM command inside Ubuntu (WSL) from Windows Python.
 
-    Uses ["wsl", "bash", "-ic", ...] so Ubuntu's ~/.bashrc is sourced,
-    which loads OpenFOAM environment variables (WM_PROJECT_DIR, PATH, etc.)
-    before the command executes.
+    Uses ["wsl", "bash", "-lc", ...] so Ubuntu loads its login profile
+    (~/.bash_profile / ~/.profile), which sources OpenFOAM environment
+    variables (WM_PROJECT_DIR, PATH, etc.) before the command executes.
+
+    NOTE: We use -lc (login, non-interactive) NOT -ic (interactive).
+    The -i flag causes bash to wait for an interactive session and will
+    HANG / TIMEOUT inside uvicorn or any non-TTY process.
 
     Args:
         openfoam_cmd:  Bare OpenFOAM command, e.g. "blockMesh" or "checkMesh"
@@ -98,7 +102,7 @@ def wsl_run(openfoam_cmd: str, case_dir: str, timeout: int = 300) -> subprocess.
     full_cmd = f"cd '{wsl_path}' && {openfoam_cmd}"
 
     return subprocess.run(
-        ["wsl", "bash", "-ic", full_cmd],
+        ["wsl", "bash", "-lc", full_cmd],
         capture_output=True,
         text=True,
         timeout=timeout,
@@ -201,12 +205,22 @@ async def health_check():
     Safe to call without an OpenFOAM case present.
     """
     try:
-        result = wsl_run("echo OK", "/tmp", timeout=10)
+        # Use a simple WSL command with a native Linux path to avoid path-conversion.
+        # bash -lc is used (login, non-interactive) so it doesn't hang on TTY.
+        result = subprocess.run(
+            ["wsl", "bash", "-lc", "echo OK"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
         wsl_ok = result.returncode == 0
         wsl_msg = result.stdout.strip() if wsl_ok else result.stderr.strip()
     except FileNotFoundError:
         wsl_ok = False
         wsl_msg = "wsl.exe not found — install WSL from Microsoft Store"
+    except subprocess.TimeoutExpired:
+        wsl_ok = False
+        wsl_msg = "WSL timed out — check that your Ubuntu distro is running"
 
     return {
         "status": "running",
@@ -346,3 +360,4 @@ async def predict_mass_flow(payload: Rd0110DimensionsPayload):
         "mass_flow_ox_kg_s": round(m_dot_ox, 5),
         "vertices_v1_v16": compute_v1_to_v16_vertices(payload),
     }
+
