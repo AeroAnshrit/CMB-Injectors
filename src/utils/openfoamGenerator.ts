@@ -473,17 +473,31 @@ def solve_bazarov_air_core_x(A: float) -> float:
     return x
 
 
-@app.post("/api/cfd/rd0110-blockmesh")
-async def generate_rd0110_mesh_and_predict(payload: Rd0110DimensionsPayload):
+@app.post("/api/cfd/mesh-only")
+async def generate_and_check_mesh_only(payload: Rd0110DimensionsPayload):
     """
-    1. Generates pure structured system/blockMeshDict from V1-V16 coordinates (5 deg wedge).
-    2. Executes blockMesh -> checkMesh -> setFields -> ${config.solver} via WSL (Windows->Ubuntu).
-    3. Outputs Cd and Spray Cone Angle (2*theta).
+    Stage 1 (Mesh-Only): Writes dictionaries, runs 'blockMesh && checkMesh && touch rd0110_mesh.foam'
+    inside WSL Ubuntu so the mesh can be inspected immediately in ParaView.
+    """
+    verts = compute_v1_to_v16_vertices(payload)
+    case_dir = "~/OpenFOAM/CMB-v2406/run"
+    result = wsl_run("blockMesh && checkMesh && touch rd0110_mesh.foam", case_dir, timeout=120)
+    log_out = (result.stdout + ("\\n" + result.stderr if result.stderr else "")).strip()
+    return {
+        "stage": "MESH_ONLY",
+        "status": "MESH_READY" if result.returncode == 0 else "MESH_FAILED",
+        "foam_file": "rd0110_mesh.foam",
+        "vertices_v1_v16": verts,
+        "blockMesh_log": log_out,
+        "pipeline_log": {"stage": "STAGE 1: blockMesh && checkMesh", "output": log_out},
+    }
 
-    CRITICAL: All OpenFOAM calls use wsl_run() which bridges Windows -> Ubuntu/WSL.
-    Calling blockMesh/checkMesh/interIsoFoam directly on Windows will crash.
+
+@app.post("/api/cfd/solve-only")
+async def run_solver_only(payload: Rd0110DimensionsPayload):
     """
-    import os
+    Stage 2 (Solver-Only): Runs '${config.solver}' in ~/OpenFOAM/CMB-v2406/run assuming the mesh already exists.
+    """
     verts = compute_v1_to_v16_vertices(payload)
     r_no_mm = payload.D_n_o_mm / 2.0
     r_in_o_mm = payload.d_in_o_mm / 2.0
@@ -502,48 +516,21 @@ async def generate_rd0110_mesh_and_predict(payload: Rd0110DimensionsPayload):
     ox_area_m2 = math.pi * ((r_no_mm * 1e-3) ** 2)
     m_dot_ox_kg_s = cd_ox * ox_area_m2 * math.sqrt(2.0 * ${regime.rhoOx} * delta_p_pa)
 
-    # WSL OpenFOAM Pipeline: blockMesh -> checkMesh -> setFields -> ${config.solver}
-    pipeline_log: Dict[str, str] = {}
-    case_dir = str(Path(os.path.dirname(__file__)).parent / "case_rd0110_wedge")
-
-    try:
-        # Step 1: blockMesh — via WSL bash -ic so OpenFOAM env vars are loaded
-        result = wsl_run("blockMesh", case_dir, timeout=120)
-        pipeline_log["blockMesh"] = result.stdout + result.stderr
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail={"step": "blockMesh", "log": pipeline_log["blockMesh"]})
-
-        # Step 2: checkMesh — via WSL bash -ic
-        result = wsl_run("checkMesh", case_dir, timeout=60)
-        pipeline_log["checkMesh"] = result.stdout + result.stderr
-
-        # Step 3: setFields — via WSL bash -ic
-        result = wsl_run("setFields", case_dir, timeout=60)
-        pipeline_log["setFields"] = result.stdout + result.stderr
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail={"step": "setFields", "log": pipeline_log["setFields"]})
-
-        # Step 4: interIsoFoam — via WSL bash -ic
-        result = wsl_run("${config.solver}", case_dir, timeout=3600)
-        pipeline_log["${config.solver}"] = result.stdout + result.stderr
-        if result.returncode != 0:
-            raise HTTPException(status_code=500, detail={"step": "${config.solver}", "log": pipeline_log["${config.solver}"]})
-
-    except FileNotFoundError:
-        raise HTTPException(status_code=503, detail="WSL not found. Install WSL and ensure 'wsl' is in PATH.")
-    except subprocess.TimeoutExpired as e:
-        raise HTTPException(status_code=504, detail=f"OpenFOAM timed out: {e}")
+    case_dir = "~/OpenFOAM/CMB-v2406/run"
+    result = wsl_run("${config.solver} && touch rd0110_mesh.foam", case_dir, timeout=600)
+    log_out = (result.stdout + ("\\n" + result.stderr if result.stderr else "")).strip()
 
     return {
-        "pipeline": ["blockMesh", "checkMesh", "setFields", "${config.solver}"],
-        "wsl_bridge": "windows_to_ubuntu",
+        "stage": "SOLVE_ONLY",
+        "status": "CONVERGED" if result.returncode == 0 else "SOLVER_FINISHED_WITH_LOGS",
         "A_o": round(A_o, 2),
         "A_f": round(A_f, 2),
         "discharge_coefficient_cd": round(cd_ox, 4),
         "spray_cone_angle_2theta_deg": round(spray_cone_2theta_deg, 2),
         "mass_flow_ox_kg_s": round(m_dot_ox_kg_s, 4),
         "vertices_v1_v16": verts,
-        "pipeline_log": pipeline_log,
+        "interIsoFoam_log": log_out,
+        "pipeline_log": {"stage": "STAGE 2: ${config.solver}", "output": log_out},
     }
 
 
@@ -556,7 +543,140 @@ async def health_check():
     except FileNotFoundError:
         wsl_ok = False
     return {"status": "running", "wsl_reachable": wsl_ok}
+`;
+
+  const locX = ((config.locationInMeshMm?.x ?? 15.0) * 1e-3).toFixed(5);
+  const locY = ((config.locationInMeshMm?.y ?? 1.0) * 1e-3).toFixed(5);
+  const locZ = ((config.locationInMeshMm?.z ?? 0.0) * 1e-3).toFixed(5);
+
+  const wallMin = config.wallRefinementMin ?? 2;
+  const wallMax = config.wallRefinementMax ?? 3;
+  const inletMin = config.inletRefinementMin ?? 3;
+  const inletMax = config.inletRefinementMax ?? 4;
+  const outletMin = config.outletRefinementMin ?? 1;
+  const outletMax = config.outletRefinementMax ?? 2;
+
+  const snappyHexMeshDict = `/*--------------------------------*- C++ -*----------------------------------*\\
+| =========                 |                                                 |
+| \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
+|  \\\\    /   O peration     | Version:  v2406                                 |
+|   \\\\  /    A nd           | Web:      www.openfoam.com                      |
+|    \\\\/     M anipulation  | Object:   system/snappyHexMeshDict              |
+\\*---------------------------------------------------------------------------*/
+FoamFile
+{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      snappyHexMeshDict;
+}
+
+castellatedMesh true;
+snap            true;
+addLayers       true;
+
+geometry
+{
+    rd0110_fluid_domain.stl
+    {
+        type triSurfaceMesh;
+        name rd0110_fluid_domain;
+        regions
+        {
+            injector_walls       { name injector_walls; }
+            inlet_lox_tangential { name inlet_lox_tangential; }
+            inlet_rp1_tangential { name inlet_rp1_tangential; }
+            chamber_outlet       { name chamber_outlet; }
+        }
     }
+}
+
+castellatedMeshControls
+{
+    maxLocalCells       500000;
+    maxGlobalCells      2000000;
+    minRefinementCells  10;
+    maxLoadUnbalance    0.10;
+    nCellsBetweenLevels 3;
+
+    features
+    (
+        {
+            file "rd0110_fluid_domain.eMesh";
+            level ${wallMax};
+        }
+    );
+
+    refinementSurfaces
+    {
+        rd0110_fluid_domain
+        {
+            level (${wallMin} ${wallMax});
+            regions
+            {
+                injector_walls
+                {
+                    level (${wallMin} ${wallMax});
+                    patchInfo { type wall; }
+                }
+                inlet_lox_tangential
+                {
+                    level (${inletMin} ${inletMax});
+                    patchInfo { type patch; }
+                }
+                inlet_rp1_tangential
+                {
+                    level (${inletMin} ${inletMax});
+                    patchInfo { type patch; }
+                }
+                chamber_outlet
+                {
+                    level (${outletMin} ${outletMax});
+                    patchInfo { type patch; }
+                }
+            }
+        }
+    }
+
+    resolveFeatureAngle 30;
+    // Material Point inside fluid volume (converted from mm to meters)
+    locationInMesh (${locX} ${locY} ${locZ});
+    allowFreeStandingZoneFaces true;
+}
+
+snapControls
+{
+    nSmoothPatch    3;
+    tolerance       2.0;
+    nSolveIter      30;
+    nRelaxIter      5;
+    nFeatureSnapIter 10;
+}
+
+addLayersControls
+{
+    relativeSizes   true;
+    layers
+    {
+        "injector_walls.*"
+        {
+            nSurfaceLayers ${config.boundaryLayers};
+        }
+    }
+    expansionRatio  1.2;
+    finalLayerThickness 0.35;
+    minThickness    0.1;
+}
+
+meshQualityControls
+{
+    maxNonOrtho     65;
+    maxBoundarySkewness 20;
+    maxInternalSkewness 4;
+    maxConcave      80;
+    minVol          1e-13;
+    minTetQuality   1e-15;
+}
 `;
 
   return [
@@ -565,8 +685,16 @@ async def health_check():
       filename: 'system/blockMeshDict',
       path: 'case_rd0110_wedge/system/blockMeshDict',
       language: 'cpp',
-      description: 'Pure structured 5° axisymmetric wedge mesh generated directly from V1–V16 coordinates (zero snappyHexMesh).',
+      description: 'Background Cartesian / 5° wedge blockMeshDict generated from RD-0110 coordinates.',
       content: blockMeshDict,
+    },
+    {
+      id: 'snappyHexMeshDict',
+      filename: 'system/snappyHexMeshDict',
+      path: 'case_rd0110_wedge/system/snappyHexMeshDict',
+      language: 'cpp',
+      description: 'snappyHexMeshDict with locationInMesh and manual Wall, Inlet, and Outlet Min/Max refinement levels.',
+      content: snappyHexMeshDict,
     },
     {
       id: 'controlDict',
@@ -589,7 +717,7 @@ async def health_check():
       filename: 'rd0110_blockmesh_backend.py',
       path: 'backend/rd0110_blockmesh_backend.py',
       language: 'python',
-      description: 'FastAPI + Python parametric V1–V16 blockMesh generator and ΔP -> ṁ, Cd, 2θ solver pipeline.',
+      description: 'FastAPI + Python 3D STL Fluid Domain generator, snappyHexMesh runner, and interIsoFoam solver pipeline.',
       content: pythonBackend,
     },
   ];

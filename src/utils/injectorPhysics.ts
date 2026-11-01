@@ -78,9 +78,20 @@ export interface InjectorConfig {
   fuelTangentialOffsetRadiusMm: number; // R_in,f = 4.50 mm
   fuelTangentialPortAxialPosMm: number; // x_in,f = 8.80 mm
 
-  // 4. Pure Structured blockMesh Configuration (5° Axisymmetric Wedge)
+  // 4. Background blockMesh & snappyHexMesh Configuration
   meshDomain: MeshDomainType;
   baseCellSizeUm: number;
+  locationInMeshMm: {
+    x: number;
+    y: number;
+    z: number;
+  };
+  wallRefinementMin: number;
+  wallRefinementMax: number;
+  inletRefinementMin: number;
+  inletRefinementMax: number;
+  outletRefinementMin: number;
+  outletRefinementMax: number;
   boundaryLayers: number;
   amrMaxLevel: number;
   targetYPlus: number;
@@ -258,9 +269,20 @@ export const DEFAULT_RD0110_CONFIG: InjectorConfig = {
   fuelTangentialOffsetRadiusMm: 4.50,  // R_in,f = 4.50 mm
   fuelTangentialPortAxialPosMm: 8.80,  // x_in,f = 8.80 mm
 
-  // Structured blockMesh (5 deg axisymmetric wedge)
+  // Background blockMesh & snappyHexMesh Configuration
   meshDomain: 'wedge_5deg',
   baseCellSizeUm: 45,
+  locationInMeshMm: {
+    x: 15.0,
+    y: 1.0,
+    z: 0.0,
+  },
+  wallRefinementMin: 2,
+  wallRefinementMax: 3,
+  inletRefinementMin: 3,
+  inletRefinementMax: 4,
+  outletRefinementMin: 1,
+  outletRefinementMax: 2,
   boundaryLayers: 5,
   amrMaxLevel: 2,
   targetYPlus: 0.85,

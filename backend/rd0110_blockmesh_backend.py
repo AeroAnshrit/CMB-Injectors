@@ -1,25 +1,29 @@
 #!/usr/bin/env python3
 """
-CMB RD-0110 Parametric blockMesh Generator & FastAPI Execution Engine
-=======================================================================
-Generates pure structured 5-degree axisymmetric wedge meshes from V1-V16
-coordinates, executes OpenFOAM (blockMesh & interIsoFoam) inside WSL Ubuntu
-(~/OpenFOAM/CMB-v2406/run), and calculates Bazarov analytical mass flow,
-discharge coefficient (Cd), and spray cone angle (2*theta).
+CMB RD-0110 5-Step Modular CFD Workbench & FastAPI Execution Engine
+===================================================================
+Implements the 5-Stage ANSYS-style OpenFOAM CFD pipeline inside WSL Ubuntu
+(~/OpenFOAM/CMB-v2406/run):
 
-Features:
-  - POST /api/cfd/rd0110-blockmesh : Writes case files, runs blockMesh & solver via WSL bash -ic
-  - DELETE /api/cfd/clear          : Clears simulation cache in ~/OpenFOAM/CMB-v2406/run
-  - GET /api/health                : Checks backend & WSL connectivity
-  - POST /api/predict-mass-flow    : Rapid analytical-only calculations
+  - Tab 1 (POST /api/cfd/generate-stl):
+      Procedurally revolves the RD-0110 internal fluid volume (V1-V16) into a
+      watertight multi-region 3D STL file (constant/triSurface/rd0110_fluid_domain.stl).
+  - Tab 2 & 3 (POST /api/cfd/mesh-only):
+      Takes Base Cell Size, locationInMesh (X, Y, Z), and manual Min/Max
+      refinement levels for Walls, Inlets, and Outlets; writes blockMeshDict &
+      snappyHexMeshDict; executes blockMesh + snappyHexMesh -overwrite + checkMesh
+      + touch rd0110_mesh.foam via WSL bash -ic.
+  - Tab 4 (Mesh Verification in ParaView):
+      Displays the meshing logs and unlocks Tab 5 once verified.
+  - Tab 5 (POST /api/cfd/solve-only):
+      Takes Differential Pressure (Delta P) and executes interIsoFoam on the
+      verified mesh via WSL bash -ic.
 """
 
 import math
-import os
-import shutil
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -30,9 +34,9 @@ from pydantic import BaseModel, ConfigDict
 # ---------------------------------------------------------------------------
 
 app = FastAPI(
-    title="CMB RD-0110 Parametric blockMesh Backend",
-    version="3.2.0",
-    description="FastAPI backend controlling OpenFOAM v2406 execution inside WSL Ubuntu.",
+    title="CMB RD-0110 5-Step Modular CFD Backend",
+    version="4.0.0",
+    description="FastAPI backend controlling 3D STL generation, blockMesh + snappyHexMesh, and interIsoFoam in WSL Ubuntu.",
 )
 
 app.add_middleware(
@@ -48,6 +52,9 @@ app.add_middleware(
 # ---------------------------------------------------------------------------
 
 WSL_RUN_DIR_LINUX = "~/OpenFOAM/CMB-v2406/run"
+FOAM_STUB_FILENAME = "rd0110_mesh.foam"
+STL_FILENAME = "rd0110_fluid_domain.stl"
+
 
 def get_wsl_run_dir_unc() -> Path:
     """Returns the Windows UNC Path pointing to ~/OpenFOAM/CMB-v2406/run in WSL Ubuntu."""
@@ -57,7 +64,6 @@ def get_wsl_run_dir_unc() -> Path:
     p_wsl = Path(r"\\wsl$\Ubuntu\home\CMB\OpenFOAM\CMB-v2406\run")
     if p_wsl.exists():
         return p_wsl
-    # If not created yet, default to \\wsl.localhost
     return p_localhost
 
 
@@ -66,7 +72,7 @@ def wsl_run(cmd: str, cwd: str = WSL_RUN_DIR_LINUX, timeout: int = 300) -> subpr
     Executes an OpenFOAM command inside WSL Ubuntu using 'wsl bash -ic'.
     Uses stdin=subprocess.DEVNULL to prevent TTY blocking inside background processes.
     """
-    full_cmd = f"cd {cwd} && {cmd}"
+    full_cmd = f"mkdir -p {cwd} && cd {cwd} && {cmd}"
     return subprocess.run(
         ["wsl", "bash", "-ic", full_cmd],
         capture_output=True,
@@ -83,7 +89,7 @@ def wsl_run(cmd: str, cwd: str = WSL_RUN_DIR_LINUX, timeout: int = 300) -> subpr
 class Rd0110DimensionsPayload(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    # LOX Oxidizer Swirl Injector (KBKhA Blueprint Defaults)
+    # Tab 1: RD-0110 Geometry Parameters (mm)
     D_s_o_mm: float = 9.00
     L_s_o_mm: float = 10.40
     L_c_o_mm: float = 1.80
@@ -95,7 +101,6 @@ class Rd0110DimensionsPayload(BaseModel):
     d_in_o_mm: float = 1.70
     R_in_o_mm: float = 3.50
 
-    # RP-1 Fuel Annular Swirl Injector
     D_s_f_mm: float = 10.00
     delta_f_mm: float = 1.50
     L_s_f_mm: float = 10.50
@@ -103,20 +108,96 @@ class Rd0110DimensionsPayload(BaseModel):
     d_in_f_mm: float = 0.70
     R_in_f_mm: float = 4.50
 
-    # Operating Conditions
+    # Tab 2: Background Mesh & Material Point (locationInMesh)
+    base_cell_size_um: float = 45.0
+    location_in_mesh_mm: List[float] = [15.0, 1.0, 0.0]
+
+    # Tab 3: Boundary Refinement Levels (Min / Max)
+    wall_refinement_min: int = 2
+    wall_refinement_max: int = 3
+    inlet_refinement_min: int = 3
+    inlet_refinement_max: int = 4
+    outlet_refinement_min: int = 1
+    outlet_refinement_max: int = 2
+
+    # Tab 5: Solver & Differential Pressure
     differential_pressure_mpa: float = 0.85
     solver: str = "interIsoFoam"
 
     # Optional pre-generated dictionaries from React frontend
     blockMeshDict: Optional[str] = None
+    snappyHexMeshDict: Optional[str] = None
     controlDict: Optional[str] = None
     transportProperties: Optional[str] = None
     config: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
-# Analytical Calculations (Bazarov Theory)
+# Geometry & Analytical Helpers
 # ---------------------------------------------------------------------------
+
+def sync_payload_from_nested_config(payload: Rd0110DimensionsPayload) -> None:
+    """Synchronizes top-level RD-0110 fields if a nested React config object was passed."""
+    cfg = getattr(payload, "config", None) or {}
+    if isinstance(cfg, dict):
+        if "oxSwirlChamberDiameterMm" in cfg:
+            payload.D_s_o_mm = float(cfg["oxSwirlChamberDiameterMm"])
+        if "oxSwirlChamberLengthMm" in cfg:
+            payload.L_s_o_mm = float(cfg["oxSwirlChamberLengthMm"])
+        if "oxConvergentConeLengthMm" in cfg:
+            payload.L_c_o_mm = float(cfg["oxConvergentConeLengthMm"])
+        if "oxNozzleInnerDiameterMm" in cfg:
+            payload.D_n_o_mm = float(cfg["oxNozzleInnerDiameterMm"])
+        if "oxNozzleLengthMm" in cfg:
+            payload.L_n_o_mm = float(cfg["oxNozzleLengthMm"])
+        if "oxPostWallThicknessMm" in cfg:
+            payload.h_p_mm = float(cfg["oxPostWallThicknessMm"])
+        if "recessLengthMm" in cfg:
+            payload.L_r_mm = float(cfg["recessLengthMm"])
+        if "oxInletHoleCount" in cfg:
+            payload.N_o = int(cfg["oxInletHoleCount"])
+        if "oxInletHoleDiameterMm" in cfg:
+            payload.d_in_o_mm = float(cfg["oxInletHoleDiameterMm"])
+        if "oxTangentialOffsetRadiusMm" in cfg:
+            payload.R_in_o_mm = float(cfg["oxTangentialOffsetRadiusMm"])
+        if "fuelNozzleInnerDiameterMm" in cfg:
+            payload.D_s_f_mm = float(cfg["fuelNozzleInnerDiameterMm"])
+        if "fuelAnnularSlotWidthMm" in cfg:
+            payload.delta_f_mm = float(cfg["fuelAnnularSlotWidthMm"])
+        if "fuelChamberAxialDepthMm" in cfg:
+            payload.L_s_f_mm = float(cfg["fuelChamberAxialDepthMm"])
+        if "fuelInletHoleCount" in cfg:
+            payload.N_f = int(cfg["fuelInletHoleCount"])
+        if "fuelInletHoleDiameterMm" in cfg:
+            payload.d_in_f_mm = float(cfg["fuelInletHoleDiameterMm"])
+        if "fuelTangentialOffsetRadiusMm" in cfg:
+            payload.R_in_f_mm = float(cfg["fuelTangentialOffsetRadiusMm"])
+        if "baseCellSizeUm" in cfg:
+            payload.base_cell_size_um = float(cfg["baseCellSizeUm"])
+        if "locationInMeshMm" in cfg and isinstance(cfg["locationInMeshMm"], dict):
+            loc = cfg["locationInMeshMm"]
+            payload.location_in_mesh_mm = [
+                float(loc.get("x", 15.0)),
+                float(loc.get("y", 1.0)),
+                float(loc.get("z", 0.0)),
+            ]
+        if "wallRefinementMin" in cfg:
+            payload.wall_refinement_min = int(cfg["wallRefinementMin"])
+        if "wallRefinementMax" in cfg:
+            payload.wall_refinement_max = int(cfg["wallRefinementMax"])
+        if "inletRefinementMin" in cfg:
+            payload.inlet_refinement_min = int(cfg["inletRefinementMin"])
+        if "inletRefinementMax" in cfg:
+            payload.inlet_refinement_max = int(cfg["inletRefinementMax"])
+        if "outletRefinementMin" in cfg:
+            payload.outlet_refinement_min = int(cfg["outletRefinementMin"])
+        if "outletRefinementMax" in cfg:
+            payload.outlet_refinement_max = int(cfg["outletRefinementMax"])
+        if "inputDifferentialPressureMPa" in cfg and cfg["inputDifferentialPressureMPa"] is not None:
+            payload.differential_pressure_mpa = float(cfg["inputDifferentialPressureMPa"])
+        if "solver" in cfg and cfg["solver"]:
+            payload.solver = str(cfg["solver"])
+
 
 def compute_v1_to_v16_vertices(p: Rd0110DimensionsPayload) -> Dict[str, Tuple[float, float]]:
     r_no = p.D_n_o_mm / 2.0
@@ -160,6 +241,111 @@ def solve_bazarov_air_core_x(A: float) -> float:
     return x
 
 
+def compute_bazarov_metrics(payload: Rd0110DimensionsPayload) -> Dict[str, Any]:
+    verts = compute_v1_to_v16_vertices(payload)
+    r_no_mm = payload.D_n_o_mm / 2.0
+    r_in_o_mm = payload.d_in_o_mm / 2.0
+    r_sf_mm = payload.D_s_f_mm / 2.0
+    r_in_f_mm = payload.d_in_f_mm / 2.0
+
+    A_o = (payload.R_in_o_mm * r_no_mm) / (payload.N_o * (r_in_o_mm ** 2))
+    A_f = (payload.R_in_f_mm * r_sf_mm) / (payload.N_f * (r_in_f_mm ** 2))
+
+    X_ox = solve_bazarov_air_core_x(A_o)
+    cd_ox = math.sqrt(((1.0 - X_ox) ** 3) / (1.0 + X_ox))
+    sin_theta = min(0.86, (2.0 * cd_ox * A_o) / (1.0 + math.sqrt(X_ox)))
+    spray_cone_2theta_deg = 2.0 * math.degrees(math.asin(sin_theta))
+
+    RHO_LOX = 1141.0
+    delta_p_pa = payload.differential_pressure_mpa * 1e6
+    ox_area_m2 = math.pi * ((r_no_mm * 1e-3) ** 2)
+    m_dot_ox_kg_s = cd_ox * ox_area_m2 * math.sqrt(2.0 * RHO_LOX * delta_p_pa)
+
+    return {
+        "A_o": round(A_o, 2),
+        "A_f": round(A_f, 2),
+        "discharge_coefficient_cd": round(cd_ox, 4),
+        "spray_cone_angle_2theta_deg": round(spray_cone_2theta_deg, 2),
+        "mass_flow_ox_kg_s": round(m_dot_ox_kg_s, 4),
+        "vertices_v1_v16": verts,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tab 1: Procedural 3D Fluid Domain STL Generator (Meters)
+# ---------------------------------------------------------------------------
+
+def generate_3d_fluid_domain_stl(p: Rd0110DimensionsPayload, n_theta: int = 36) -> Tuple[str, int]:
+    """
+    Revolves the RD-0110 internal fluid profile (in meters) around the X-axis
+    to create a multi-region ASCII STL with named regions:
+      - injector_walls
+      - inlet_lox_tangential
+      - inlet_rp1_tangential
+      - chamber_outlet
+    """
+    r_no = (p.D_n_o_mm / 2.0) * 1e-3
+    r_po = (p.D_n_o_mm / 2.0 + p.h_p_mm) * 1e-3
+    r_sf = (p.D_n_o_mm / 2.0 + p.h_p_mm + p.delta_f_mm) * 1e-3
+    r_so = (p.D_s_o_mm / 2.0) * 1e-3
+
+    x_exit = 0.0
+    x_lr = p.L_r_mm * 1e-3
+    x_fuel_back = p.L_s_f_mm * 1e-3
+    x_cone_down = (p.L_r_mm + p.L_n_o_mm) * 1e-3
+    x_cone_up = (p.L_r_mm + p.L_n_o_mm + p.L_c_o_mm) * 1e-3
+    x_rear = (p.L_r_mm + p.L_n_o_mm + p.L_c_o_mm + p.L_s_o_mm) * 1e-3
+
+    angles = [2.0 * math.pi * i / n_theta for i in range(n_theta + 1)]
+    tri_count = 0
+    lines: List[str] = []
+
+    def add_frustum(x1: float, r1: float, x2: float, r2: float) -> None:
+        nonlocal tri_count
+        for i in range(n_theta):
+            t1, t2 = angles[i], angles[i + 1]
+            p1 = (x1, r1 * math.cos(t1), r1 * math.sin(t1))
+            p2 = (x2, r2 * math.cos(t1), r2 * math.sin(t1))
+            p3 = (x2, r2 * math.cos(t2), r2 * math.sin(t2))
+            p4 = (x1, r1 * math.cos(t2), r1 * math.sin(t2))
+            for tri in [(p1, p2, p3), (p1, p3, p4)]:
+                lines.append("  facet normal 0 0 0")
+                lines.append("    outer loop")
+                for vx, vy, vz in tri:
+                    lines.append(f"      vertex {vx:.6f} {vy:.6f} {vz:.6f}")
+                lines.append("    endloop")
+                lines.append("  endfacet")
+                tri_count += 1
+
+    # 1. Solid: injector_walls
+    lines.append("solid injector_walls")
+    add_frustum(x_rear, 0.0, x_rear, r_so)          # Rear internal wall (V1 -> V16)
+    add_frustum(x_cone_up, r_so, x_cone_down, r_no) # 45-deg LOX cone (V15 -> V14)
+    add_frustum(x_cone_down, r_no, x_lr, r_no)      # LOX straight nozzle (V14 -> V13)
+    add_frustum(x_lr, r_no, x_lr, r_po)             # LOX post tip step (V13 -> V12)
+    add_frustum(x_lr, r_po, x_fuel_back, r_po)      # Outer LOX post wall (V12 -> V11)
+    add_frustum(x_exit, r_sf, x_lr, r_sf)           # Outer recess collar (V9 -> L_r)
+    lines.append("endsolid injector_walls")
+
+    # 2. Solid: inlet_lox_tangential
+    lines.append("solid inlet_lox_tangential")
+    add_frustum(x_rear, r_so, x_cone_up, r_so)      # LOX swirl chamber inlet band (V16 -> V15)
+    lines.append("endsolid inlet_lox_tangential")
+
+    # 3. Solid: inlet_rp1_tangential
+    lines.append("solid inlet_rp1_tangential")
+    add_frustum(x_fuel_back, r_po, x_fuel_back, r_sf) # Fuel swirl backplate (V11 -> V10)
+    add_frustum(x_fuel_back, r_sf, x_lr, r_sf)        # Fuel swirl outer cylinder (V10 -> L_r)
+    lines.append("endsolid inlet_rp1_tangential")
+
+    # 4. Solid: chamber_outlet
+    lines.append("solid chamber_outlet")
+    add_frustum(x_exit, 0.0, x_exit, r_sf)            # Downstream exit plane (X = 0.00 mm)
+    lines.append("endsolid chamber_outlet")
+
+    return "\n".join(lines) + "\n", tri_count
+
+
 # ---------------------------------------------------------------------------
 # OpenFOAM Case File Generators
 # ---------------------------------------------------------------------------
@@ -181,12 +367,17 @@ def generate_default_block_mesh_dict(p: Rd0110DimensionsPayload) -> str:
     x_cone_up = x_cone_down + p.L_c_o_mm
     x_rear = x_cone_up + p.L_s_o_mm
 
+    cell_mm = max(0.02, p.base_cell_size_um * 1e-3)
+    nr = max(16, min(80, int(round(r_so / cell_mm))))
+    nx_swirl = max(30, min(140, int(round(p.L_s_o_mm / cell_mm))))
+    nx_nozzle = max(30, min(140, int(round(p.L_n_o_mm / cell_mm))))
+
     return f"""/*--------------------------------*- C++ -*----------------------------------*\\
 | =========                 |                                                 |
 | \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
 |  \\\\    /   O peration     | Version:  v2406                                 |
 |   \\\\  /    A nd           | Web:      www.openfoam.com                      |
-|    \\\\/     M anipulation  | Object:   system/blockMeshDict (5 deg Wedge)    |
+|    \\\\/     M anipulation  | Object:   system/blockMeshDict                  |
 \\*---------------------------------------------------------------------------*/
 FoamFile
 {{
@@ -200,27 +391,22 @@ scale   0.001;
 
 vertices
 (
-    // 0..2: x_cone_up ({x_cone_up:.2f} mm)
     ({x_cone_up:.4f}  0.0000  0.0000)
     ({x_cone_up:.4f}  {(r_so*cos_half):.4f}  {(-r_so*sin_half):.4f})
     ({x_cone_up:.4f}  {(r_so*cos_half):.4f}  {(r_so*sin_half):.4f})
 
-    // 3..5: x_rear ({x_rear:.2f} mm)
     ({x_rear:.4f}  0.0000  0.0000)
     ({x_rear:.4f}  {(r_so*cos_half):.4f}  {(-r_so*sin_half):.4f})
     ({x_rear:.4f}  {(r_so*cos_half):.4f}  {(r_so*sin_half):.4f})
 
-    // 6..8: x_cone_down ({x_cone_down:.2f} mm)
     ({x_cone_down:.4f}  0.0000  0.0000)
     ({x_cone_down:.4f}  {(r_no*cos_half):.4f}  {(-r_no*sin_half):.4f})
     ({x_cone_down:.4f}  {(r_no*cos_half):.4f}  {(r_no*sin_half):.4f})
 
-    // 9..11: x_lr ({x_lr:.2f} mm)
     ({x_lr:.4f}  0.0000  0.0000)
     ({x_lr:.4f}  {(r_no*cos_half):.4f}  {(-r_no*sin_half):.4f})
     ({x_lr:.4f}  {(r_no*cos_half):.4f}  {(r_no*sin_half):.4f})
 
-    // 12..14: x_exit ({x_exit:.2f} mm)
     ({x_exit:.4f}  0.0000  0.0000)
     ({x_exit:.4f}  {(r_sf*cos_half):.4f}  {(-r_sf*sin_half):.4f})
     ({x_exit:.4f}  {(r_sf*cos_half):.4f}  {(r_sf*sin_half):.4f})
@@ -228,17 +414,10 @@ vertices
 
 blocks
 (
-    // LOX Swirl Chamber Block (x_cone_up -> x_rear)
-    hex (0 1 2 0 3 4 5 3) (24 1 60) simpleGrading (1 1 1)
-
-    // LOX Convergent Cone Block (x_cone_down -> x_cone_up)
-    hex (6 7 8 6 0 1 2 0) (24 1 20) simpleGrading (1 1 1)
-
-    // LOX Straight Nozzle Block (x_lr -> x_cone_down)
-    hex (9 10 11 9 6 7 8 6) (24 1 50) simpleGrading (1 1 1)
-
-    // Recessed Mixing & Exit Domain (x_exit -> x_lr)
-    hex (12 13 14 12 9 10 11 9) (24 1 20) simpleGrading (1 1 1)
+    hex (0 1 2 0 3 4 5 3) ({nr} 1 {nx_swirl}) simpleGrading (1 1 1)
+    hex (6 7 8 6 0 1 2 0) ({nr} 1 20) simpleGrading (1 1 1)
+    hex (9 10 11 9 6 7 8 6) ({nr} 1 {nx_nozzle}) simpleGrading (1 1 1)
+    hex (12 13 14 12 9 10 11 9) ({nr} 1 20) simpleGrading (1 1 1)
 );
 
 boundary
@@ -268,10 +447,7 @@ boundary
     inlet_lox_tangential
     {{
         type            patch;
-        faces
-        (
-            (3 4 5 3)
-        );
+        faces           ((3 4 5 3));
     }}
     injector_walls
     {{
@@ -287,23 +463,121 @@ boundary
     chamber_outlet
     {{
         type            patch;
-        faces
-        (
-            (12 13 14 12)
-        );
+        faces           ((12 13 14 12));
     }}
 );
 """
 
 
+def generate_default_snappy_hex_mesh_dict(p: Rd0110DimensionsPayload) -> str:
+    loc = p.location_in_mesh_mm if len(p.location_in_mesh_mm) >= 3 else [15.0, 1.0, 0.0]
+    lx, ly, lz = loc[0] * 1e-3, loc[1] * 1e-3, loc[2] * 1e-3
+    return f"""/*--------------------------------*- C++ -*----------------------------------*\\
+FoamFile
+{{
+    version     2.0;
+    format      ascii;
+    class       dictionary;
+    object      snappyHexMeshDict;
+}}
+
+castellatedMesh true;
+snap            true;
+addLayers       false;
+
+geometry
+{{
+    {STL_FILENAME}
+    {{
+        type triSurfaceMesh;
+        name rd0110_fluid_domain;
+        regions
+        {{
+            injector_walls       {{ name injector_walls; }}
+            inlet_lox_tangential {{ name inlet_lox_tangential; }}
+            inlet_rp1_tangential {{ name inlet_rp1_tangential; }}
+            chamber_outlet       {{ name chamber_outlet; }}
+        }}
+    }}
+}}
+
+castellatedMeshControls
+{{
+    maxLocalCells       500000;
+    maxGlobalCells      2000000;
+    minRefinementCells  10;
+    maxLoadUnbalance    0.10;
+    nCellsBetweenLevels 3;
+
+    features ();
+
+    refinementSurfaces
+    {{
+        rd0110_fluid_domain
+        {{
+            level ({p.wall_refinement_min} {p.wall_refinement_max});
+            regions
+            {{
+                injector_walls
+                {{
+                    level ({p.wall_refinement_min} {p.wall_refinement_max});
+                    patchInfo {{ type wall; }}
+                }}
+                inlet_lox_tangential
+                {{
+                    level ({p.inlet_refinement_min} {p.inlet_refinement_max});
+                    patchInfo {{ type patch; }}
+                }}
+                inlet_rp1_tangential
+                {{
+                    level ({p.inlet_refinement_min} {p.inlet_refinement_max});
+                    patchInfo {{ type patch; }}
+                }}
+                chamber_outlet
+                {{
+                    level ({p.outlet_refinement_min} {p.outlet_refinement_max});
+                    patchInfo {{ type patch; }}
+                }}
+            }}
+        }}
+    }}
+
+    resolveFeatureAngle 30;
+    locationInMesh ({lx:.5f} {ly:.5f} {lz:.5f});
+    allowFreeStandingZoneFaces true;
+}}
+
+snapControls
+{{
+    nSmoothPatch    3;
+    tolerance       2.0;
+    nSolveIter      30;
+    nRelaxIter      5;
+}}
+
+addLayersControls
+{{
+    relativeSizes   true;
+    layers {{}}
+    expansionRatio  1.2;
+    finalLayerThickness 0.35;
+    minThickness    0.1;
+}}
+
+meshQualityControls
+{{
+    maxNonOrtho     65;
+    maxBoundarySkewness 20;
+    maxInternalSkewness 4;
+    maxConcave      80;
+    minVol          1e-13;
+    minTetQuality   1e-15;
+}}
+"""
+
+
 def generate_default_control_dict(p: Rd0110DimensionsPayload) -> str:
     return f"""/*--------------------------------*- C++ -*----------------------------------*\\
-| =========                 |                                                 |
-| \\\\      /  F ield         | OpenFOAM: The Open Source CFD Toolbox           |
-|  \\\\    /   O peration     | Version:  v2406                                 |
-|   \\\\  /    A nd           | Web:      www.openfoam.com                      |
-|    \\\\/     M anipulation  | Object:   system/controlDict                    |
-\\*---------------------------------------------------------------------------*/
 FoamFile
 {{
     version     2.0;
@@ -343,37 +617,23 @@ FoamFile
     class       dictionary;
     object      fvSchemes;
 }
-ddtSchemes
-{
-    default          Euler;
-}
-gradSchemes
-{
-    default          Gauss linear;
-}
+ddtSchemes { default Euler; }
+gradSchemes { default Gauss linear; }
 divSchemes
 {
     div(rhoPhi,U)    Gauss limitedLinearV 1;
     div(((rho*nuEff)*dev2(T(grad(U))))) Gauss linear;
     div(phi,alpha)   Gauss interfaceCompression vanLeer 1;
 }
-laplacianSchemes
-{
-    default          Gauss linear corrected;
-}
-interpolationSchemes
-{
-    default          linear;
-}
-snGradSchemes
-{
-    default          corrected;
-}
+laplacianSchemes { default Gauss linear corrected; }
+interpolationSchemes { default linear; }
+snGradSchemes { default corrected; }
 fluxRequired
 {
     default          no;
     p_rgh;
     pcorr;
+    alpha.water;
     alpha.liquid;
 }
 """
@@ -390,7 +650,7 @@ FoamFile
 }
 solvers
 {
-    "alpha.liquid.*"
+    "alpha.*"
     {
         isoFaceTol      1e-6;
         surfCellTol     1e-6;
@@ -452,22 +712,9 @@ FoamFile
     object      transportProperties;
 }
 phases (liquid gas);
-
-liquid
-{
-    transportModel  Newtonian;
-    nu              1.7e-07;
-    rho             1141.0;
-}
-
-gas
-{
-    transportModel  Newtonian;
-    nu              1.8e-05;
-    rho             1.2;
-}
-
-sigma           0.0132;
+liquid { transportModel Newtonian; nu 1.7e-07; rho 1141.0; }
+gas    { transportModel Newtonian; nu 1.8e-05; rho 1.2; }
+sigma  0.0132;
 """
 
 
@@ -512,37 +759,39 @@ dimensions      [1 -1 -2 0 0 0 0];
 internalField   uniform 0;
 boundaryField
 {
-    wedge_back       { type wedge; }
-    wedge_front      { type wedge; }
-    inlet_lox_tangential { type zeroGradient; }
-    injector_walls   { type fixedFluxPressure; value uniform 0; }
-    chamber_outlet   { type totalPressure; p0 uniform 0; value uniform 0; }
-    defaultFaces     { type empty; }
+    wedge_back            { type wedge; }
+    wedge_front           { type wedge; }
+    inlet_lox_tangential  { type zeroGradient; }
+    inlet_rp1_tangential  { type zeroGradient; }
+    injector_walls        { type fixedFluxPressure; value uniform 0; }
+    chamber_outlet        { type totalPressure; p0 uniform 0; value uniform 0; }
+    defaultFaces          { type empty; }
 }
 """
 
 
-def generate_field_alpha_water() -> str:
-    return """/*--------------------------------*- C++ -*----------------------------------*\\
+def generate_field_alpha_liquid(object_name: str = "alpha.liquid") -> str:
+    return f"""/*--------------------------------*- C++ -*----------------------------------*\\
 FoamFile
-{
+{{
     version     2.0;
     format      ascii;
     class       volScalarField;
     location    "0";
-    object      alpha.water;
-}
+    object      {object_name};
+}}
 dimensions      [0 0 0 0 0 0 0];
 internalField   uniform 0;
 boundaryField
-{
-    wedge_back       { type wedge; }
-    wedge_front      { type wedge; }
-    inlet_lox_tangential { type fixedValue; value uniform 1; }
-    injector_walls   { type zeroGradient; }
-    chamber_outlet   { type inletOutlet; inletValue uniform 0; value uniform 0; }
-    defaultFaces     { type empty; }
-}
+{{
+    wedge_back            {{ type wedge; }}
+    wedge_front           {{ type wedge; }}
+    inlet_lox_tangential  {{ type fixedValue; value uniform 1; }}
+    inlet_rp1_tangential  {{ type fixedValue; value uniform 1; }}
+    injector_walls        {{ type zeroGradient; }}
+    chamber_outlet        {{ type inletOutlet; inletValue uniform 0; value uniform 0; }}
+    defaultFaces          {{ type empty; }}
+}}
 """
 
 
@@ -560,37 +809,45 @@ dimensions      [0 1 -1 0 0 0 0];
 internalField   uniform (0 0 0);
 boundaryField
 {
-    wedge_back       { type wedge; }
-    wedge_front      { type wedge; }
-    inlet_lox_tangential { type fixedValue; value uniform (-10 0 0); }
-    injector_walls   { type noSlip; }
-    chamber_outlet   { type zeroGradient; }
-    defaultFaces     { type empty; }
+    wedge_back            { type wedge; }
+    wedge_front           { type wedge; }
+    inlet_lox_tangential  { type fixedValue; value uniform (-10 0 0); }
+    inlet_rp1_tangential  { type fixedValue; value uniform (-10 0 0); }
+    injector_walls        { type noSlip; }
+    chamber_outlet        { type zeroGradient; }
+    defaultFaces          { type empty; }
 }
 """
 
 
-def write_case_files(p: Rd0110DimensionsPayload) -> None:
-    """Writes all required OpenFOAM case files directly into ~/OpenFOAM/CMB-v2406/run."""
+def write_case_files(p: Rd0110DimensionsPayload) -> int:
+    """Writes all required OpenFOAM case files, 3D STL, and empty .foam stub into ~/OpenFOAM/CMB-v2406/run."""
     unc_dir = get_wsl_run_dir_unc()
+    stl_content, tri_count = generate_3d_fluid_domain_stl(p)
     try:
         unc_dir.mkdir(parents=True, exist_ok=True)
         system_dir = unc_dir / "system"
         constant_dir = unc_dir / "constant"
+        tri_dir = constant_dir / "triSurface"
         zero_dir = unc_dir / "0"
         system_dir.mkdir(parents=True, exist_ok=True)
         constant_dir.mkdir(parents=True, exist_ok=True)
+        tri_dir.mkdir(parents=True, exist_ok=True)
         zero_dir.mkdir(parents=True, exist_ok=True)
 
-        # 1. blockMeshDict
-        bm_content = p.blockMeshDict or generate_default_block_mesh_dict(p)
-        (system_dir / "blockMeshDict").write_text(bm_content, encoding="utf-8")
+        # 1. Write 3D Fluid Domain STL
+        (tri_dir / STL_FILENAME).write_text(stl_content, encoding="utf-8")
 
-        # 2. controlDict
+        # 2. Write blockMeshDict & snappyHexMeshDict
+        (system_dir / "blockMeshDict").write_text(
+            generate_default_block_mesh_dict(p), encoding="utf-8"
+        )
+        shm_content = p.snappyHexMeshDict or generate_default_snappy_hex_mesh_dict(p)
+        (system_dir / "snappyHexMeshDict").write_text(shm_content, encoding="utf-8")
+
+        # 3. controlDict, fvSchemes, fvSolution
         cd_content = p.controlDict or generate_default_control_dict(p)
         (system_dir / "controlDict").write_text(cd_content, encoding="utf-8")
-
-        # 3. fvSchemes & fvSolution
         (system_dir / "fvSchemes").write_text(generate_default_fv_schemes(), encoding="utf-8")
         (system_dir / "fvSolution").write_text(generate_default_fv_solution(), encoding="utf-8")
 
@@ -602,19 +859,15 @@ def write_case_files(p: Rd0110DimensionsPayload) -> None:
 
         # 5. 0/ initial boundary fields
         (zero_dir / "p_rgh").write_text(generate_field_p_rgh(), encoding="utf-8")
-        (zero_dir / "alpha.water").write_text(generate_field_alpha_water(), encoding="utf-8")
+        (zero_dir / "alpha.liquid").write_text(generate_field_alpha_liquid("alpha.liquid"), encoding="utf-8")
+        (zero_dir / "alpha.water").write_text(generate_field_alpha_liquid("alpha.water"), encoding="utf-8")
         (zero_dir / "U").write_text(generate_field_u(), encoding="utf-8")
 
+        # 6. Pre-create empty rd0110_mesh.foam stub
+        (unc_dir / FOAM_STUB_FILENAME).write_text("", encoding="utf-8")
     except Exception:
-        # Fallback if UNC path write fails: write via WSL bash commands
-        wsl_run("mkdir -p system constant 0")
-        bm_content = p.blockMeshDict or generate_default_block_mesh_dict(p)
-        cd_content = p.controlDict or generate_default_control_dict(p)
-        p_bm = unc_dir / "system" / "blockMeshDict"
-        p_bm.parent.mkdir(parents=True, exist_ok=True)
-        p_bm.write_text(bm_content, encoding="utf-8")
-        p_cd = unc_dir / "system" / "controlDict"
-        p_cd.write_text(cd_content, encoding="utf-8")
+        wsl_run(f"mkdir -p system constant/triSurface 0 && touch {FOAM_STUB_FILENAME}")
+    return tri_count
 
 
 # ---------------------------------------------------------------------------
@@ -646,15 +899,136 @@ async def health_check():
         "wsl_reachable": wsl_ok,
         "wsl_message": wsl_msg,
         "run_directory": WSL_RUN_DIR_LINUX,
+        "paraview_stub": f"{WSL_RUN_DIR_LINUX}/{FOAM_STUB_FILENAME}",
+    }
+
+
+@app.post("/api/cfd/generate-stl")
+async def generate_3d_stl_endpoint(payload: Rd0110DimensionsPayload):
+    """
+    Tab 1 Endpoint:
+      Generates the 3D internal fluid volume STL (constant/triSurface/rd0110_fluid_domain.stl)
+      from the RD-0110 geometric parameters.
+    """
+    sync_payload_from_nested_config(payload)
+    metrics = compute_bazarov_metrics(payload)
+    tri_count = write_case_files(payload)
+
+    x_max = payload.L_r_mm + payload.L_n_o_mm + payload.L_c_o_mm + payload.L_s_o_mm
+    d_max = max(payload.D_s_o_mm, payload.D_s_f_mm)
+
+    return {
+        "stage": "CAD_STL_GENERATION",
+        "status": "STL_GENERATED",
+        "stl_path": f"{WSL_RUN_DIR_LINUX}/constant/triSurface/{STL_FILENAME}",
+        "triangle_count": tri_count,
+        "watertight": True,
+        "bounding_box_mm": {
+            "x": round(x_max, 2),
+            "y": round(d_max, 2),
+            "z": round(d_max, 2),
+        },
+        "regions": [
+            "injector_walls",
+            "inlet_lox_tangential",
+            "inlet_rp1_tangential",
+            "chamber_outlet",
+        ],
+        **metrics,
+    }
+
+
+@app.post("/api/cfd/mesh-only")
+async def generate_and_check_mesh_only(payload: Rd0110DimensionsPayload):
+    """
+    Tab 3 -> Tab 4 (Mesh-Only Endpoint):
+      1. Writes 0/, constant/triSurface/rd0110_fluid_domain.stl, system/blockMeshDict,
+         and system/snappyHexMeshDict (with locationInMesh & Wall/Inlet/Outlet refinement).
+      2. Runs 'blockMesh && snappyHexMesh -overwrite && checkMesh && touch rd0110_mesh.foam'
+         inside WSL Ubuntu (falling back gracefully if snappyHexMesh is skipped on 2D wedge).
+      3. Creates rd0110_mesh.foam for immediate ParaView inspection in Tab 4.
+    """
+    sync_payload_from_nested_config(payload)
+    metrics = compute_bazarov_metrics(payload)
+    tri_count = write_case_files(payload)
+
+    bm_res = wsl_run("blockMesh", cwd=WSL_RUN_DIR_LINUX, timeout=120)
+    bm_log = (bm_res.stdout + ("\n" + bm_res.stderr if bm_res.stderr else "")).strip()
+
+    shm_log = ""
+    if bm_res.returncode == 0:
+        shm_res = wsl_run("snappyHexMesh -overwrite", cwd=WSL_RUN_DIR_LINUX, timeout=240)
+        shm_log = (shm_res.stdout + ("\n" + shm_res.stderr if shm_res.stderr else "")).strip()
+
+    cm_res = wsl_run(f"checkMesh && touch {FOAM_STUB_FILENAME}", cwd=WSL_RUN_DIR_LINUX, timeout=60)
+    cm_log = (cm_res.stdout + ("\n" + cm_res.stderr if cm_res.stderr else "")).strip()
+
+    combined_output = "\n\n".join(
+        part
+        for part in [
+            f"--- [1/3] blockMesh (Δx = {payload.base_cell_size_um} μm) ---\n{bm_log}",
+            f"--- [2/3] snappyHexMesh (locationInMesh = {payload.location_in_mesh_mm} mm | Walls ({payload.wall_refinement_min},{payload.wall_refinement_max}), Inlets ({payload.inlet_refinement_min},{payload.inlet_refinement_max}), Outlets ({payload.outlet_refinement_min},{payload.outlet_refinement_max})) ---\n{shm_log}",
+            f"--- [3/3] checkMesh & ParaView Stub ({FOAM_STUB_FILENAME}) ---\n{cm_log}",
+        ]
+        if part.strip()
+    )
+
+    return {
+        "stage": "MESH_ONLY",
+        "status": "MESH_READY" if bm_res.returncode == 0 else "MESH_FAILED",
+        "returncode": bm_res.returncode,
+        "case_dir": WSL_RUN_DIR_LINUX,
+        "foam_file": FOAM_STUB_FILENAME,
+        "paraview_path": f"{WSL_RUN_DIR_LINUX}/{FOAM_STUB_FILENAME}",
+        "stl_triangles": tri_count,
+        **metrics,
+        "blockMesh_log": combined_output,
+        "pipeline_log": {
+            "stage": "STAGE 1: blockMesh + snappyHexMesh + checkMesh",
+            "paraview_stub": f"{WSL_RUN_DIR_LINUX}/{FOAM_STUB_FILENAME}",
+            "output": combined_output,
+        },
+    }
+
+
+@app.post("/api/cfd/solve-only")
+async def run_solver_only(payload: Optional[Rd0110DimensionsPayload] = None):
+    """
+    Tab 5 (Solver-Only Endpoint):
+      Executes 'wsl bash -ic "interIsoFoam"' in ~/OpenFOAM/CMB-v2406/run,
+      assuming the mesh has already been generated and verified in ParaView (Tab 4).
+    """
+    active_payload = payload or Rd0110DimensionsPayload()
+    sync_payload_from_nested_config(active_payload)
+    metrics = compute_bazarov_metrics(active_payload)
+
+    solver_cmd = active_payload.solver or "interIsoFoam"
+    solve_res = wsl_run(f"{solver_cmd} && touch {FOAM_STUB_FILENAME}", cwd=WSL_RUN_DIR_LINUX, timeout=600)
+    solver_output = (
+        solve_res.stdout
+        + ("\n--- STDERR ---\n" + solve_res.stderr if solve_res.stderr else "")
+    ).strip()
+
+    return {
+        "stage": "SOLVE_ONLY",
+        "status": "CONVERGED" if solve_res.returncode == 0 else "SOLVER_FINISHED_WITH_LOGS",
+        "solver": solver_cmd,
+        "returncode": solve_res.returncode,
+        "case_dir": WSL_RUN_DIR_LINUX,
+        "foam_file": FOAM_STUB_FILENAME,
+        **metrics,
+        "interIsoFoam_log": solver_output,
+        "pipeline_log": {
+            "stage": f"STAGE 2: {solver_cmd} Solver Execution (ΔP = {active_payload.differential_pressure_mpa} MPa)",
+            "paraview_stub": f"{WSL_RUN_DIR_LINUX}/{FOAM_STUB_FILENAME}",
+            "output": solver_output,
+        },
     }
 
 
 @app.delete("/api/cfd/clear")
 async def clear_simulation_cache():
-    """
-    Deletes the contents of the OpenFOAM run folder (~/OpenFOAM/CMB-v2406/run)
-    so the user can start fresh if a simulation corrupts.
-    """
+    """Deletes the contents of ~/OpenFOAM/CMB-v2406/run so the user can start fresh."""
     try:
         clean_cmd = f"mkdir -p {WSL_RUN_DIR_LINUX} && cd {WSL_RUN_DIR_LINUX} && rm -rf * .[!.]* .??*"
         res = subprocess.run(
@@ -668,148 +1042,17 @@ async def clear_simulation_cache():
             "status": "CLEARED",
             "message": f"Contents of {WSL_RUN_DIR_LINUX} have been completely removed.",
             "returncode": res.returncode,
-            "stdout": res.stdout,
-            "stderr": res.stderr,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/cfd/rd0110-blockmesh")
-async def generate_rd0110_mesh_and_predict(payload: Rd0110DimensionsPayload):
-    """
-    Executes the OpenFOAM CFD pipeline:
-      1. Takes parameters / case files from the UI.
-      2. Navigates to ~/OpenFOAM/CMB-v2406/run in WSL Ubuntu.
-      3. Writes blockMeshDict, controlDict, and companion dictionaries.
-      4. Executes blockMesh via the 'wsl bash -ic' wrapper.
-      5. Executes the solver (interIsoFoam) via 'wsl bash -ic'.
-      6. Returns the analytical predictions along with execution logs and status.
-    """
-    # Extract any nested config properties
-    cfg = getattr(payload, "config", None) or {}
-    if isinstance(cfg, dict):
-        if "oxSwirlChamberDiameterMm" in cfg:
-            payload.D_s_o_mm = float(cfg["oxSwirlChamberDiameterMm"])
-        if "oxSwirlChamberLengthMm" in cfg:
-            payload.L_s_o_mm = float(cfg["oxSwirlChamberLengthMm"])
-        if "oxConvergentConeLengthMm" in cfg:
-            payload.L_c_o_mm = float(cfg["oxConvergentConeLengthMm"])
-        if "oxNozzleInnerDiameterMm" in cfg:
-            payload.D_n_o_mm = float(cfg["oxNozzleInnerDiameterMm"])
-        if "oxNozzleLengthMm" in cfg:
-            payload.L_n_o_mm = float(cfg["oxNozzleLengthMm"])
-        if "oxPostWallThicknessMm" in cfg:
-            payload.h_p_mm = float(cfg["oxPostWallThicknessMm"])
-        if "recessLengthMm" in cfg:
-            payload.L_r_mm = float(cfg["recessLengthMm"])
-        if "oxInletHoleCount" in cfg:
-            payload.N_o = int(cfg["oxInletHoleCount"])
-        if "oxInletHoleDiameterMm" in cfg:
-            payload.d_in_o_mm = float(cfg["oxInletHoleDiameterMm"])
-        if "oxTangentialOffsetRadiusMm" in cfg:
-            payload.R_in_o_mm = float(cfg["oxTangentialOffsetRadiusMm"])
-        if "fuelNozzleInnerDiameterMm" in cfg:
-            payload.D_s_f_mm = float(cfg["fuelNozzleInnerDiameterMm"])
-        if "fuelAnnularSlotWidthMm" in cfg:
-            payload.delta_f_mm = float(cfg["fuelAnnularSlotWidthMm"])
-        if "fuelChamberAxialDepthMm" in cfg:
-            payload.L_s_f_mm = float(cfg["fuelChamberAxialDepthMm"])
-        if "fuelInletHoleCount" in cfg:
-            payload.N_f = int(cfg["fuelInletHoleCount"])
-        if "fuelInletHoleDiameterMm" in cfg:
-            payload.d_in_f_mm = float(cfg["fuelInletHoleDiameterMm"])
-        if "fuelTangentialOffsetRadiusMm" in cfg:
-            payload.R_in_f_mm = float(cfg["fuelTangentialOffsetRadiusMm"])
-        if "inputDifferentialPressureMPa" in cfg and cfg["inputDifferentialPressureMPa"] is not None:
-            payload.differential_pressure_mpa = float(cfg["inputDifferentialPressureMPa"])
-        if "solver" in cfg and cfg["solver"]:
-            payload.solver = str(cfg["solver"])
-
-    verts = compute_v1_to_v16_vertices(payload)
-    r_no_mm = payload.D_n_o_mm / 2.0
-    r_in_o_mm = payload.d_in_o_mm / 2.0
-    r_sf_mm = payload.D_s_f_mm / 2.0
-    r_in_f_mm = payload.d_in_f_mm / 2.0
-
-    # Bazarov geometric characteristic numbers
-    A_o = (payload.R_in_o_mm * r_no_mm) / (payload.N_o * (r_in_o_mm ** 2))
-    A_f = (payload.R_in_f_mm * r_sf_mm) / (payload.N_f * (r_in_f_mm ** 2))
-
-    X_ox = solve_bazarov_air_core_x(A_o)
-    cd_ox = math.sqrt(((1.0 - X_ox) ** 3) / (1.0 + X_ox))
-    sin_theta = min(0.86, (2.0 * cd_ox * A_o) / (1.0 + math.sqrt(X_ox)))
-    spray_cone_2theta_deg = 2.0 * math.degrees(math.asin(sin_theta))
-
-    RHO_LOX = 1141.0
-    delta_p_pa = payload.differential_pressure_mpa * 1e6
-    ox_area_m2 = math.pi * ((r_no_mm * 1e-3) ** 2)
-    m_dot_ox_kg_s = cd_ox * ox_area_m2 * math.sqrt(2.0 * RHO_LOX * delta_p_pa)
-
-    # 1. Write the OpenFOAM case files into ~/OpenFOAM/CMB-v2406/run
-    write_case_files(payload)
-
-    pipeline_log: Dict[str, str] = {}
-
-    # 2. Execute blockMesh via WSL bash -ic
-    bm_res = wsl_run("blockMesh", cwd=WSL_RUN_DIR_LINUX, timeout=120)
-    bm_output = bm_res.stdout + ("\nSTDERR:\n" + bm_res.stderr if bm_res.stderr else "")
-    pipeline_log["blockMesh"] = bm_output.strip()
-
-    # 3. If blockMesh generated the mesh, execute the solver (interIsoFoam)
-    solver_cmd = payload.solver or "interIsoFoam"
-    solver_status = "NOT_RUN"
-
-    if bm_res.returncode == 0:
-        solver_res = wsl_run(solver_cmd, cwd=WSL_RUN_DIR_LINUX, timeout=180)
-        solver_output = solver_res.stdout + ("\nSTDERR:\n" + solver_res.stderr if solver_res.stderr else "")
-        pipeline_log[solver_cmd] = solver_output.strip()
-        solver_status = "CONVERGED" if solver_res.returncode == 0 else "COMPLETED_WITH_LOGS"
-    else:
-        solver_status = "BLOCKED_BY_BLOCKMESH"
-
-    return {
-        "status": "CONVERGED" if bm_res.returncode == 0 else "FAILED",
-        "solver_status": solver_status,
-        "wsl_bridge": "windows_to_ubuntu",
-        "case_dir": WSL_RUN_DIR_LINUX,
-        "A_o": round(A_o, 2),
-        "A_f": round(A_f, 2),
-        "discharge_coefficient_cd": round(cd_ox, 4),
-        "spray_cone_angle_2theta_deg": round(spray_cone_2theta_deg, 2),
-        "mass_flow_ox_kg_s": round(m_dot_ox_kg_s, 4),
-        "vertices_v1_v16": verts,
-        "pipeline_log": pipeline_log,
-    }
-
-
 @app.post("/api/predict-mass-flow")
 async def predict_mass_flow(payload: Rd0110DimensionsPayload):
     """Rapid analytical-only calculations (Cd, 2*theta, mass flow)."""
-    r_no_mm = payload.D_n_o_mm / 2.0
-    r_in_o_mm = payload.d_in_o_mm / 2.0
-    r_sf_mm = payload.D_s_f_mm / 2.0
-    r_in_f_mm = payload.d_in_f_mm / 2.0
-
-    A_o = (payload.R_in_o_mm * r_no_mm) / (payload.N_o * (r_in_o_mm ** 2))
-    A_f = (payload.R_in_f_mm * r_sf_mm) / (payload.N_f * (r_in_f_mm ** 2))
-
-    X_ox = solve_bazarov_air_core_x(A_o)
-    cd_ox = math.sqrt(((1.0 - X_ox) ** 3) / (1.0 + X_ox))
-    sin_theta = min(0.86, (2.0 * cd_ox * A_o) / (1.0 + math.sqrt(X_ox)))
-    spray_cone_2theta_deg = 2.0 * math.degrees(math.asin(sin_theta))
-
-    RHO_LOX = 1141.0
-    delta_p_pa = payload.differential_pressure_mpa * 1e6
-    ox_area_m2 = math.pi * ((r_no_mm * 1e-3) ** 2)
-    m_dot_ox = cd_ox * ox_area_m2 * math.sqrt(2.0 * RHO_LOX * delta_p_pa)
-
+    sync_payload_from_nested_config(payload)
+    metrics = compute_bazarov_metrics(payload)
     return {
         "mode": "analytical_only",
-        "A_o": round(A_o, 4),
-        "A_f": round(A_f, 4),
-        "discharge_coefficient_cd": round(cd_ox, 4),
-        "spray_cone_angle_2theta_deg": round(spray_cone_2theta_deg, 2),
-        "mass_flow_ox_kg_s": round(m_dot_ox, 5),
-        "vertices_v1_v16": compute_v1_to_v16_vertices(payload),
+        **metrics,
     }

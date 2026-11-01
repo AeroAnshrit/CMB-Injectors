@@ -194,9 +194,15 @@ To wire the React frontend so clicking **"Run CFD Simulation"** triggers your lo
 
 ---
 
-#### Step `04. Execute` — Simulation Execution & Data Export
-- **`Run CFD Simulation` (Primary White Button)**:
-  - Triggers the solver execution loop (`POST /api/cfd/rd0110-blockmesh`), animates the PIMPLE residual convergence curves and the 2D VOF spray plume, and outputs a convergence summary banner with $\dot{m}$, $C_d$, and $2\theta$.
+#### Step `04. Execute` — Two-Stage Meshing, ParaView Verification & Solver Execution
+- **`1. Generate & Check Mesh` (Stage 1 Button $\rightarrow$ `POST /api/cfd/mesh-only`)**:
+  - Writes `0/`, `constant/`, and `system/` dictionaries into `~/OpenFOAM/CMB-v2406/run`, executes `wsl bash -ic "blockMesh && checkMesh && touch rd0110_mesh.foam"`, and creates the empty `rd0110_mesh.foam` file so you can open and visually inspect the mesh in ParaView before running the heavy VOF solver.
+  - Routes the `blockMesh` & `checkMesh` stdout/stderr directly into the **OpenFOAM Execution Logs** box under the header `Stage 1: blockMesh & checkMesh (rd0110_mesh.foam)`.
+- **`2. Run interIsoFoam Solver` (Stage 2 Button $\rightarrow$ `POST /api/cfd/solve-only`)**:
+  - Executes `wsl bash -ic "interIsoFoam"` in `~/OpenFOAM/CMB-v2406/run` on the existing verified mesh.
+  - Routes the solver stdout/stderr into the **OpenFOAM Execution Logs** box under the header `Stage 2: interIsoFoam Solver Output`.
+- **`Clear Simulation Cache` (`DELETE /api/cfd/clear`)**:
+  - Cleans `~/OpenFOAM/CMB-v2406/run` in WSL so you can start from a completely fresh directory if needed.
 - **`Export VOF CSV` Button**:
   - Downloads `CMB_RD0110_RadialVOF_Exit.csv` containing radial stations (`r_mm`, `r_norm`, `alpha_lox`, `alpha_rp1`, `axial_vel_ms`, `swirl_vel_ms`) at the injector exit plane ($X = 0\text{ mm}$) for plotting in MATLAB, Python, or ParaView.
 - **`Reset RD-0110` Button**:
